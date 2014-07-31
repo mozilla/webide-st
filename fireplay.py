@@ -9,9 +9,14 @@ import zipfile
 import uuid
 import json
 
+from twisted.internet import defer
+from fireplaylib.fxdevtools.fxconnection import connect, protocol_map
+from fireplaylib.fxdevtools.async import MainLoop
+
 from fireplaylib.client import MozClient
 from fireplaylib import b2g_helper
 from fireplaylib import firefox_helper
+reload(sys.modules['fireplay'])
 reload(sys.modules['fireplaylib.client'])
 reload(sys.modules['fireplaylib.b2g_helper'])
 reload(sys.modules['fireplaylib.firefox_helper'])
@@ -22,85 +27,115 @@ FIREPLAY_CSS_RELOAD = "document.styleSheets.reload()"
 FIREPLAY_RELOAD = "location.reload()"
 
 
+
+from twisted.internet import defer
+from twisted.internet.defer import setDebugging
+
+from fireplaylib.fxdevtools.protocol import connect
+from fireplaylib.fxdevtools import fxconnection
+import json
+
+setDebugging(False)
+
 class Fireplay:
     '''
     The Fireplay main client
     '''
     # TODO Blocking at the moment
     def __init__(self, host, port):
-        self.client = MozClient(host, port)
-        self.root = None
+        # self.client = MozClient(host, port)
+        self.client = None
+        self.tabs = None
         self.selected_tab = None
         self.selected_app = None
+        self.connected = None
+        self.host = host
+        self.port = port
+        self.loop = MainLoop(protocol_map, self.poke)
 
-    def get_root(self, force=False):
-        if not self.root or force:
-            self.root = self.client.send({
-                'to': 'root',
-                'type': 'listTabs'
-            })
+    def poke(self):
+        print "poking!"
+        sublime.set_timeout(self.loop.process, 0)
 
-        return self.root
+    def connect(self):
+        return defer.maybeDeferred(self._connect)
 
-    def get_tabs(self, force=False):
-        self.get_root(force)
-        return self.root['tabs']
+    def _connect(self):
+        if self.connected:
+            return self.connected
+
+        # XXX: grab port and hostname from settings maybe?
+        self.connected = connect(self.host, self.port)
+        self.connected.addCallback(self._connected)
+
+        self.loop.start()
+
+        return self.connected
+
+    def _connected(self, client):
+        print "setting connected to %s" % (self.client,)
+        self.client = client
+        self.connected = client
+
+
+    def errback(self, e):
+        print "ERROR: %s" % (e,)
+
+
+    # TODO what about force?
+    @defer.inlineCallbacks
+    def get_tabs(self):
+        if (self.tabs):
+            defer.returnValue(self.tabs)
+            return
+
+        root = yield self.client.root.list_tabs()
+        print "UUU", root
+        self.tabs = root['tabs']
+        defer.returnValue(self.tabs)
 
     # TODO allow multiple tabs with multiple codebase
     def select_tab(self, tab):
         self.selected_tab = tab
 
-    def reload_tab():
+    @defer.inlineCallbacks
+    def reload_tab(self):
         # TODO Avoid touching prototype, shrink in one call only
-        self.client.send({
-            'to': console,
-            'type': 'evaluateJS',
-            'text': FIREPLAY_RELOAD,
-            'frameActor': None
-        })
+        res = yield self.selected_tab.console.evaluate_js(
+            FIREPLAY_RELOAD,
+            None
+        )
+        print res
+        defer.returnValue(res)
 
+    @defer.inlineCallbacks
     def reload_css(self):
-        console = self.selected_tab['consoleActor']
 
         # TODO Avoid touching prototype, shrink in one call only
-        self.client.send({
-            'to': console,
-            'type': 'evaluateJS',
-            'text': FIREPLAY_CSS,
-            'frameActor': None
-        })
+        yield self.selected_tab.console.evaluate_js(
+            FIREPLAY_CSS,
+            None
+        )
 
-        return self.client.send({
-            'to': console,
-            'type': 'evaluateJS',
-            'text': FIREPLAY_CSS_RELOAD,
-            'frameActor': None
-        })
+        res = yield self.selected_tab.console.evaluate_js(
+            FIREPLAY_CSS_RELOAD,
+            None
+        )
+        defer.returnValue(res)
 
+    @defer.inlineCallbacks
     def get_apps(self):
-        return self.client.send({
-            'to': self.root['webappsActor'],
-            'type': 'getAll'
-        })['apps']
+        res = yield self.client.root.webappsActor.getAll()
+        defer.returnValue(res['apps'])
 
+    @defer.inlineCallbacks
     def uninstall(self, manifestURL):
-        self.client.send({
-            'to': self.root['webappsActor'],
-            'type': 'close',
-            'manifestURL': manifestURL
-        })
-        self.client.send({
-            'to': self.root['webappsActor'],
-            'type': 'uninstall',
-            'manifestURL': manifestURL
-        })
+        yield self.client.root.webappsActor.close({'manifestURL': manifestURL})
+        yield self.client.root.webappsActor.uninstall({'manifestURL': manifestURL})
 
+    @defer.inlineCallbacks
     def launch(self, manifestURL):
-        self.client.send({
-            'to': self.root['webappsActor'],
-            'type': 'launch',
-            'manifestURL': manifestURL
-        })
+        yield self.client.root.webappsActor.launch({'manifestURL': manifestURL})
 
     def deploy(self, target_app_path, run=True, debug=False):
         app_manifest = get_manifest(target_app_path)[1]
@@ -211,25 +246,25 @@ class FireplayCssReloadOnSave(sublime_plugin.EventListener):
         # TODO this should be a setting
         if re.search(get_setting('reload_on_save_regex_styles'), view.file_name()):
 
-            try:
-                if fp.client.applicationType == 'browser':
+            # try:
+                if fp.client.root.hello["applicationType"] == 'browser':
                     fp.reload_css()
                 else:
                     fp.inject_css()
-            except:
-                fp = None
-                view.run_command('fireplay_start')
+            # except:
+            #     fp = None
+            #     view.run_command('fireplay_start')
 
         elif reload_on_save and re.search(get_setting('reload_on_save_regex_reload'), view.file_name()):
-            try:
-                if fp.client.applicationType == 'browser':
+            # try:
+                if fp.client.root.hello["applicationType"] == 'browser':
                     fp.reload_tab()
                     pass
                 else:
                     fp.deploy(fp.selected_app['local_path'])
-            except:
-                fp = None
-                view.run_command('fireplay_start')
+            # except:
+            #     fp = None
+            #     view.run_command('fireplay_start')
 
 
 
@@ -241,24 +276,29 @@ class FireplayStartAnyCommand(sublime_plugin.TextCommand):
         global fp
 
         if not fp:
+            print "NOT"
             fp = Fireplay('localhost', port)
 
-        try:
-            fp.get_tabs(True)
-        except:
-            fp = None
-            self.view.run_command('fireplay_start')
-            return
+        print "connecting"
+        d = fp.connect()
+        d.addCallback(self.start_fireplay)
 
-
-        if fp.client.applicationType == 'browser':
+    def start_fireplay(self, something):
+        print something
+        print "connection exists"
+        if fp.client.root.hello["applicationType"] == 'browser':
+            print "browser"
             self.show_tabs()
         else:
             self.show_manifests()
 
+    @defer.inlineCallbacks
     def show_tabs(self):
-        self.tabs = [t for t in fp.root['tabs'] if t['url'].find('about:') == -1]
-        items = [t['url'] for t in self.tabs]
+        print "getting the tabs"
+        tabs = yield fp.get_tabs()
+        print "got em", tabs
+        self.tabs = [t for t in tabs if t.url.find('about:') == -1]
+        items = [t.url for t in self.tabs]
         items.append("Disconnect from Firefox")
         self.view.window().show_quick_panel(items, self.selecting_tab)
 
@@ -356,8 +396,9 @@ class FireplayStartCommand(sublime_plugin.TextCommand):
         global fp
 
         mapping = {}
-
+        print "fireplay i am starting", fp
         if fp:
+            print "STARTING FIREPLAY"
             self.view.run_command('fireplay_start_any')
             return
 
